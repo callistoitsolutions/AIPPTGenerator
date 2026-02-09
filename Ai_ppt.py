@@ -15,10 +15,11 @@ import sqlite3
 
 # ============ DATABASE SETUP ============
 def init_database():
-    """Initialize database"""
+    """Initialize database with migration support"""
     conn = sqlite3.connect('ppt_generator.db', check_same_thread=False)
     c = conn.cursor()
     
+    # Create users table
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   username TEXT UNIQUE NOT NULL,
@@ -29,6 +30,7 @@ def init_database():
                   is_active BOOLEAN DEFAULT 1,
                   role TEXT DEFAULT 'user')''')
     
+    # Create usage_logs table
     c.execute('''CREATE TABLE IF NOT EXISTS usage_logs
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   user_id INTEGER,
@@ -38,6 +40,7 @@ def init_database():
                   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                   FOREIGN KEY (user_id) REFERENCES users (id))''')
     
+    # Create sessions table
     c.execute('''CREATE TABLE IF NOT EXISTS sessions
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   user_id INTEGER,
@@ -47,6 +50,24 @@ def init_database():
                   session_token TEXT,
                   FOREIGN KEY (user_id) REFERENCES users (id))''')
     
+    # Migration: Add missing columns to existing sessions table
+    try:
+        # Check if is_active column exists
+        c.execute("PRAGMA table_info(sessions)")
+        columns = [column[1] for column in c.fetchall()]
+        
+        if 'is_active' not in columns:
+            c.execute("ALTER TABLE sessions ADD COLUMN is_active BOOLEAN DEFAULT 1")
+            conn.commit()
+            
+        if 'session_token' not in columns:
+            c.execute("ALTER TABLE sessions ADD COLUMN session_token TEXT")
+            conn.commit()
+    except Exception as e:
+        # If migration fails, it's okay - table might be new
+        pass
+    
+    # Create admin user if not exists
     c.execute("SELECT * FROM users WHERE username = 'admin'")
     if not c.fetchone():
         admin_password = hashlib.sha256('admin123'.encode()).hexdigest()
@@ -64,25 +85,51 @@ def verify_user(username, password):
     conn = sqlite3.connect('ppt_generator.db', check_same_thread=False)
     c = conn.cursor()
     
-    password_hash = hash_password(password)
-    c.execute("SELECT id, username, role, is_active FROM users WHERE username = ? AND password_hash = ?",
-              (username, password_hash))
-    
-    user = c.fetchone()
-    
-    if user and user[3]:
-        c.execute("UPDATE users SET last_login = ? WHERE id = ?", (datetime.now(), user[0]))
-        session_token = hashlib.md5(f"{user[0]}{datetime.now()}".encode()).hexdigest()
-        c.execute("UPDATE sessions SET is_active = 0, logout_time = ? WHERE user_id = ? AND is_active = 1", 
-                  (datetime.now(), user[0]))
-        c.execute("INSERT INTO sessions (user_id, login_time, is_active, session_token) VALUES (?, ?, ?, ?)",
-                  (user[0], datetime.now(), 1, session_token))
-        conn.commit()
+    try:
+        password_hash = hash_password(password)
+        c.execute("SELECT id, username, role, is_active FROM users WHERE username = ? AND password_hash = ?",
+                  (username, password_hash))
+        
+        user = c.fetchone()
+        
+        if user and user[3]:
+            c.execute("UPDATE users SET last_login = ? WHERE id = ?", (datetime.now(), user[0]))
+            session_token = hashlib.md5(f"{user[0]}{datetime.now()}".encode()).hexdigest()
+            
+            # Try to update sessions with is_active column
+            try:
+                c.execute("UPDATE sessions SET is_active = 0, logout_time = ? WHERE user_id = ? AND is_active = 1", 
+                          (datetime.now(), user[0]))
+            except sqlite3.OperationalError:
+                # is_active column doesn't exist, skip this step
+                pass
+            
+            # Insert new session
+            try:
+                c.execute("INSERT INTO sessions (user_id, login_time, is_active, session_token) VALUES (?, ?, ?, ?)",
+                          (user[0], datetime.now(), 1, session_token))
+            except sqlite3.OperationalError:
+                # Fallback to basic session insert without is_active
+                c.execute("INSERT INTO sessions (user_id, login_time) VALUES (?, ?)",
+                          (user[0], datetime.now()))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                'id': user[0], 
+                'username': user[1], 
+                'role': user[2], 
+                'is_active': user[3], 
+                'session_token': session_token
+            }
+        
         conn.close()
-        return {'id': user[0], 'username': user[1], 'role': user[2], 'is_active': user[3], 'session_token': session_token}
-    
-    conn.close()
-    return None
+        return None
+    except Exception as e:
+        conn.close()
+        st.error(f"Login error: {str(e)}")
+        return None
 
 def create_user_by_admin(username, password, email):
     """Admin creates user"""
@@ -103,8 +150,15 @@ def logout_user(user_id):
     """Logout user"""
     conn = sqlite3.connect('ppt_generator.db', check_same_thread=False)
     c = conn.cursor()
-    c.execute("UPDATE sessions SET is_active = 0, logout_time = ? WHERE user_id = ? AND is_active = 1",
-              (datetime.now(), user_id))
+    
+    try:
+        c.execute("UPDATE sessions SET is_active = 0, logout_time = ? WHERE user_id = ? AND is_active = 1",
+                  (datetime.now(), user_id))
+    except sqlite3.OperationalError:
+        # is_active column doesn't exist, just update logout_time
+        c.execute("UPDATE sessions SET logout_time = ? WHERE user_id = ? AND logout_time IS NULL",
+                  (datetime.now(), user_id))
+    
     conn.commit()
     conn.close()
 
@@ -143,14 +197,21 @@ def get_currently_logged_in_users():
     """Get currently logged in users with their stats"""
     conn = sqlite3.connect('ppt_generator.db', check_same_thread=False)
     c = conn.cursor()
-    c.execute("""
-        SELECT u.id, u.username, u.email, s.login_time, u.role
-        FROM sessions s
-        JOIN users u ON s.user_id = u.id
-        WHERE s.is_active = 1
-        ORDER BY s.login_time DESC
-    """)
-    active_users = c.fetchall()
+    
+    try:
+        # Try to query with is_active column
+        c.execute("""
+            SELECT u.id, u.username, u.email, s.login_time, u.role
+            FROM sessions s
+            JOIN users u ON s.user_id = u.id
+            WHERE s.is_active = 1
+            ORDER BY s.login_time DESC
+        """)
+        active_users = c.fetchall()
+    except sqlite3.OperationalError:
+        # Fallback: is_active column doesn't exist, return empty list
+        active_users = []
+    
     conn.close()
     return active_users
 
@@ -190,8 +251,13 @@ def get_system_stats():
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM users WHERE role = 'user'")
     total_users = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM sessions WHERE is_active = 1")
-    currently_online = c.fetchone()[0]
+    
+    try:
+        c.execute("SELECT COUNT(*) FROM sessions WHERE is_active = 1")
+        currently_online = c.fetchone()[0]
+    except sqlite3.OperationalError:
+        currently_online = 0
+    
     c.execute("SELECT COUNT(*) FROM usage_logs WHERE action = 'generate_presentation'")
     total_presentations = c.fetchone()[0]
     c.execute("SELECT SUM(slides_count) FROM usage_logs WHERE action = 'generate_presentation'")
