@@ -812,8 +812,9 @@ if st.session_state.user['role'] == 'admin':
     st.markdown("---")
     
     # Admin Tabs
-    admin_tab1, admin_tab2, admin_tab3, admin_tab4 = st.tabs([
+    admin_tab1, admin_tab2, admin_tab3, admin_tab4, admin_tab5 = st.tabs([
         "🟢 Live Dashboard",
+        "📊 PPT Generator",
         "➕ Create User",
         "👥 Manage Users",
         "📊 Activity Log"
@@ -891,8 +892,144 @@ if st.session_state.user['role'] == 'admin':
 </div>
                     """, unsafe_allow_html=True)
     
-    # TAB 2: CREATE USER
+    # TAB 2: PPT GENERATOR (Admin also has access)
     with admin_tab2:
+        st.markdown("## 📊 AI PowerPoint Generator")
+        st.info("ℹ️ As admin, you can also create presentations")
+        
+        # API Keys Configuration
+        st.markdown("### 🔑 API Configuration")
+        
+        col_config1, col_config2 = st.columns(2)
+        
+        with col_config1:
+            with st.expander("AI Models", expanded=True):
+                model_choice = st.selectbox(
+                    "Select Model",
+                    [
+                        "Free (Google Gemini)",
+                        "Free (Meta Llama 3.2)",
+                        "Free (Mistral 7B)",
+                        "Groq (Llama 3.3) - FREE",
+                        "Groq (Mixtral) - FREE",
+                        "Claude Sonnet (Paid)"
+                    ],
+                    key="admin_model"
+                )
+                
+                groq_api_key = None
+                if "Groq" in model_choice:
+                    groq_api_key = st.text_input("Groq API Key", type="password", help="Get free from https://console.groq.com/", key="admin_groq")
+                    if groq_api_key:
+                        st.success("✅ Groq configured")
+                else:
+                    openrouter_key = st.text_input("OpenRouter API Key", type="password", help="For AI models", key="admin_openrouter")
+        
+        with col_config2:
+            with st.expander("Image Settings"):
+                google_api_key = st.text_input("Google API Key", type="password", key="admin_google_key")
+                google_cx = st.text_input("Google CX ID", key="admin_google_cx")
+                use_unsplash = st.checkbox("Use Unsplash", value=True, key="admin_unsplash")
+        
+        st.markdown("---")
+        st.markdown("### 📝 Create Presentation")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            topic = st.text_input("📌 Topic", placeholder="e.g., AI in Healthcare", key="admin_topic")
+            category = st.selectbox("📂 Category", ["Business", "Technical", "Marketing", "Sales", "Education"], key="admin_category")
+            slide_count = st.number_input("📄 Slides", min_value=5, max_value=30, value=10, key="admin_slides")
+        
+        with col2:
+            tone = st.selectbox("🎨 Tone", ["Professional", "Casual", "Formal", "Creative"], key="admin_tone")
+            theme = st.selectbox("🎨 Theme", ["Corporate Blue", "Modern Purple", "Dark", "Soft Pastel", "Green"], key="admin_theme")
+            image_mode = st.selectbox("🖼️ Images", ["With Images", "No Images"], key="admin_images")
+        
+        language = st.selectbox("🌍 Language", ["English", "Hindi", "Spanish", "French", "German"], key="admin_language")
+        
+        key_points = st.text_area("💡 Key Points (Optional)", placeholder="- Point 1\n- Point 2", key="admin_points")
+        
+        st.markdown("---")
+        
+        if st.button("🚀 Generate Presentation", type="primary", use_container_width=True, key="admin_generate"):
+            if topic:
+                # Check API keys
+                has_api = False
+                if "Groq" in model_choice and groq_api_key:
+                    has_api = True
+                elif "Groq" not in model_choice and 'openrouter_key' in locals() and openrouter_key:
+                    has_api = True
+                
+                if not has_api:
+                    st.error("⚠️ Please enter API key above")
+                else:
+                    with st.spinner("🤖 Generating content..."):
+                        slides_content = generate_content_with_ai(
+                            openrouter_key if 'openrouter_key' in locals() else "",
+                            topic,
+                            category,
+                            slide_count,
+                            tone,
+                            "",
+                            key_points,
+                            model_choice,
+                            language,
+                            groq_api_key
+                        )
+                    
+                    if slides_content:
+                        log_usage(st.session_state.user['id'], 'generate_presentation', topic, len(slides_content))
+                        
+                        st.success(f"✅ Generated {len(slides_content)} slides!")
+                        
+                        with st.spinner("📊 Creating PowerPoint..."):
+                            prs = create_powerpoint(
+                                slides_content,
+                                theme,
+                                image_mode,
+                                google_api_key if 'google_api_key' in locals() else "",
+                                google_cx if 'google_cx' in locals() else "",
+                                use_unsplash,
+                                topic
+                            )
+                        
+                        pptx_io = io.BytesIO()
+                        prs.save(pptx_io)
+                        pptx_io.seek(0)
+                        
+                        st.markdown("---")
+                        st.markdown("### 🎉 Presentation Ready!")
+                        
+                        col_dl1, col_dl2, col_dl3 = st.columns([1, 2, 1])
+                        with col_dl2:
+                            st.download_button(
+                                label="📥 DOWNLOAD POWERPOINT",
+                                data=pptx_io.getvalue(),
+                                file_name=f"{topic.replace(' ', '_')}.pptx",
+                                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                                use_container_width=True,
+                                type="primary",
+                                key="admin_download"
+                            )
+                        
+                        st.balloons()
+                        
+                        # Preview
+                        with st.expander("📄 Preview Slides"):
+                            for idx, slide in enumerate(slides_content):
+                                st.markdown(f"### Slide {idx + 1}: {slide['title']}")
+                                if slide.get('bullets'):
+                                    for bullet in slide['bullets']:
+                                        st.markdown(f"• {bullet}")
+                                st.markdown("---")
+                    else:
+                        st.error("❌ Failed to generate content. Try another model.")
+            else:
+                st.error("⚠️ Please enter a topic")
+    
+    # TAB 3: CREATE USER
+    with admin_tab3:
         st.markdown("### ➕ Create New User")
         
         with st.form("create_user_form"):
@@ -929,8 +1066,8 @@ if st.session_state.user['role'] == 'admin':
                 else:
                     st.warning("⚠️ Fill all fields")
     
-    # TAB 3: MANAGE USERS
-    with admin_tab3:
+    # TAB 4: MANAGE USERS
+    with admin_tab4:
         st.markdown("### 👥 All Users")
         
         users = get_all_users()
@@ -979,8 +1116,8 @@ if st.session_state.user['role'] == 'admin':
                         time.sleep(1)
                         st.rerun()
     
-    # TAB 4: ACTIVITY LOG
-    with admin_tab4:
+    # TAB 5: ACTIVITY LOG
+    with admin_tab5:
         st.markdown("### 📊 Complete Activity Log")
         
         all_activities = get_all_user_activities()
