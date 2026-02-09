@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import base64
 import io
 from pptx import Presentation
 from pptx.util import Inches, Pt
@@ -9,11 +10,19 @@ from PIL import Image
 import time
 import json
 import pandas as pd
+import matplotlib.pyplot as plt
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 from datetime import datetime
 import hashlib
 import sqlite3
 
-# ============ DATABASE SETUP ============
+# ============================================================================
+# DATABASE FUNCTIONS
+# ============================================================================
+
 def init_database():
     """Initialize database with migration support"""
     conn = sqlite3.connect('ppt_generator.db', check_same_thread=False)
@@ -52,7 +61,6 @@ def init_database():
     
     # Migration: Add missing columns to existing sessions table
     try:
-        # Check if is_active column exists
         c.execute("PRAGMA table_info(sessions)")
         columns = [column[1] for column in c.fetchall()]
         
@@ -64,7 +72,6 @@ def init_database():
             c.execute("ALTER TABLE sessions ADD COLUMN session_token TEXT")
             conn.commit()
     except Exception as e:
-        # If migration fails, it's okay - table might be new
         pass
     
     # Create admin user if not exists
@@ -96,20 +103,16 @@ def verify_user(username, password):
             c.execute("UPDATE users SET last_login = ? WHERE id = ?", (datetime.now(), user[0]))
             session_token = hashlib.md5(f"{user[0]}{datetime.now()}".encode()).hexdigest()
             
-            # Try to update sessions with is_active column
             try:
                 c.execute("UPDATE sessions SET is_active = 0, logout_time = ? WHERE user_id = ? AND is_active = 1", 
                           (datetime.now(), user[0]))
             except sqlite3.OperationalError:
-                # is_active column doesn't exist, skip this step
                 pass
             
-            # Insert new session
             try:
                 c.execute("INSERT INTO sessions (user_id, login_time, is_active, session_token) VALUES (?, ?, ?, ?)",
                           (user[0], datetime.now(), 1, session_token))
             except sqlite3.OperationalError:
-                # Fallback to basic session insert without is_active
                 c.execute("INSERT INTO sessions (user_id, login_time) VALUES (?, ?)",
                           (user[0], datetime.now()))
             
@@ -128,7 +131,6 @@ def verify_user(username, password):
         return None
     except Exception as e:
         conn.close()
-        st.error(f"Login error: {str(e)}")
         return None
 
 def create_user_by_admin(username, password, email):
@@ -150,15 +152,12 @@ def logout_user(user_id):
     """Logout user"""
     conn = sqlite3.connect('ppt_generator.db', check_same_thread=False)
     c = conn.cursor()
-    
     try:
         c.execute("UPDATE sessions SET is_active = 0, logout_time = ? WHERE user_id = ? AND is_active = 1",
                   (datetime.now(), user_id))
     except sqlite3.OperationalError:
-        # is_active column doesn't exist, just update logout_time
         c.execute("UPDATE sessions SET logout_time = ? WHERE user_id = ? AND logout_time IS NULL",
                   (datetime.now(), user_id))
-    
     conn.commit()
     conn.close()
 
@@ -194,12 +193,10 @@ def get_all_users():
     return users
 
 def get_currently_logged_in_users():
-    """Get currently logged in users with their stats"""
+    """Get currently logged in users"""
     conn = sqlite3.connect('ppt_generator.db', check_same_thread=False)
     c = conn.cursor()
-    
     try:
-        # Try to query with is_active column
         c.execute("""
             SELECT u.id, u.username, u.email, s.login_time, u.role
             FROM sessions s
@@ -209,9 +206,7 @@ def get_currently_logged_in_users():
         """)
         active_users = c.fetchall()
     except sqlite3.OperationalError:
-        # Fallback: is_active column doesn't exist, return empty list
         active_users = []
-    
     conn.close()
     return active_users
 
@@ -251,13 +246,11 @@ def get_system_stats():
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM users WHERE role = 'user'")
     total_users = c.fetchone()[0]
-    
     try:
         c.execute("SELECT COUNT(*) FROM sessions WHERE is_active = 1")
         currently_online = c.fetchone()[0]
     except sqlite3.OperationalError:
         currently_online = 0
-    
     c.execute("SELECT COUNT(*) FROM usage_logs WHERE action = 'generate_presentation'")
     total_presentations = c.fetchone()[0]
     c.execute("SELECT SUM(slides_count) FROM usage_logs WHERE action = 'generate_presentation'")
@@ -289,9 +282,339 @@ def delete_user(user_id):
     conn.commit()
     conn.close()
 
-# ============ LOGIN PAGE ============
+# ============================================================================
+# IMAGE GENERATION FUNCTIONS
+# ============================================================================
+
+def get_google_image(query, api_key, cx):
+    """Get image using Google Custom Search API"""
+    try:
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            'key': api_key,
+            'cx': cx,
+            'q': query,
+            'searchType': 'image',
+            'num': 3,
+            'imgSize': 'large',
+            'imgType': 'photo',
+            'safe': 'active',
+            'fileType': 'jpg,png'
+        }
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if 'items' in data and len(data['items']) > 0:
+                for item in data['items'][:3]:
+                    try:
+                        image_url = item['link']
+                        img_response = requests.get(image_url, timeout=10, headers={
+                            'User-Agent': 'Mozilla/5.0'
+                        })
+                        if img_response.status_code == 200 and len(img_response.content) > 5000:
+                            img = Image.open(io.BytesIO(img_response.content))
+                            if img.size[0] > 300 and img.size[1] > 200:
+                                return img_response.content
+                    except:
+                        continue
+        return None
+    except:
+        return None
+
+def get_unsplash_image(query, width=800, height=600):
+    """Get image from Unsplash"""
+    try:
+        clean_query = query.strip().replace(' ', ',')
+        url = f"https://source.unsplash.com/{width}x{height}/?{clean_query}"
+        response = requests.get(url, timeout=15, allow_redirects=True, headers={
+            'User-Agent': 'Mozilla/5.0'
+        })
+        if response.status_code == 200 and len(response.content) > 5000:
+            return response.content
+        return None
+    except:
+        return None
+
+def get_topic_relevant_image(main_topic, slide_title, google_api_key, google_cx, use_unsplash):
+    """Get relevant image"""
+    search_terms = []
+    if slide_title:
+        search_terms.append(slide_title)
+    if main_topic:
+        search_terms.append(main_topic)
+    
+    for term in search_terms:
+        if google_api_key and google_cx:
+            image_data = get_google_image(term, google_api_key, google_cx)
+            if image_data:
+                return image_data
+        
+        if use_unsplash:
+            image_data = get_unsplash_image(term)
+            if image_data:
+                return image_data
+    
+    return None
+
+# ============================================================================
+# AI CONTENT GENERATION
+# ============================================================================
+
+def repair_truncated_json(json_text):
+    """Attempt to repair truncated JSON"""
+    text = json_text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+    
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    
+    slides = []
+    slides_start = text.find('"slides"')
+    if slides_start == -1:
+        return None
+    
+    bracket_pos = text.find('[', slides_start)
+    if bracket_pos == -1:
+        return None
+    
+    current_pos = bracket_pos + 1
+    brace_count = 0
+    slide_start = -1
+    
+    while current_pos < len(text):
+        char = text[current_pos]
+        if char == '{' and brace_count == 0:
+            slide_start = current_pos
+            brace_count = 1
+        elif char == '{':
+            brace_count += 1
+        elif char == '}':
+            brace_count -= 1
+            if brace_count == 0 and slide_start != -1:
+                slide_text = text[slide_start:current_pos + 1]
+                try:
+                    slide_obj = json.loads(slide_text)
+                    if 'title' in slide_obj:
+                        if 'bullets' not in slide_obj:
+                            slide_obj['bullets'] = []
+                        if 'image_prompt' not in slide_obj:
+                            slide_obj['image_prompt'] = slide_obj['title']
+                        if 'speaker_notes' not in slide_obj:
+                            slide_obj['speaker_notes'] = ""
+                        slides.append(slide_obj)
+                except:
+                    pass
+                slide_start = -1
+        current_pos += 1
+    
+    if slides:
+        return {"slides": slides}
+    return None
+
+def generate_content_with_ai(api_key, topic, category, slide_count, tone, audience, key_points, model_choice, language, groq_api_key=None):
+    """Generate presentation content using AI"""
+    try:
+        use_groq_api = "Groq" in model_choice and groq_api_key
+        
+        if use_groq_api:
+            if "Llama 3.3" in model_choice:
+                model = "llama-3.3-70b-versatile"
+            else:
+                model = "mixtral-8x7b-32768"
+            api_url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {groq_api_key.strip()}",
+                "Content-Type": "application/json",
+            }
+        else:
+            if "Gemini" in model_choice:
+                model = "google/gemini-2.0-flash-exp:free"
+            elif "Llama" in model_choice:
+                model = "meta-llama/llama-3.2-3b-instruct:free"
+            elif "Mistral" in model_choice:
+                model = "mistralai/mistral-7b-instruct:free"
+            else:
+                model = "anthropic/claude-3.5-sonnet"
+            api_url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key.strip()}",
+                "Content-Type": "application/json",
+            }
+        
+        calculated_tokens = min(slide_count * 350 + 500, 4000)
+        language_instruction = f"Generate ALL content in {language} language." if language != "English" else ""
+        
+        prompt = f"""{language_instruction}
+Create a {slide_count}-slide presentation about: {topic}
+Category: {category} | Tone: {tone} | Audience: {audience}
+{f"Include these points: {key_points}" if key_points else ""}
+
+Return ONLY valid JSON (no markdown):
+{{"slides": [
+  {{
+    "title": "Main Title",
+    "bullets": [],
+    "image_prompt": "professional {topic}",
+    "speaker_notes": "Introduction"
+  }},
+  {{
+    "title": "Key Point",
+    "bullets": ["Point 1", "Point 2", "Point 3"],
+    "image_prompt": "{topic} concept",
+    "speaker_notes": "Explain points"
+  }}
+]}}
+
+CRITICAL:
+1. First slide: TITLE ONLY (empty bullets)
+2. Other slides: 3-5 bullets each
+3. Complete sentences (8-15 words)
+4. Total: exactly {slide_count} slides
+5. Return ONLY JSON
+
+Generate now:"""
+
+        response = requests.post(
+            api_url,
+            headers=headers,
+            json={
+                "model": model,
+                "max_tokens": calculated_tokens,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            content_text = data["choices"][0]["message"]["content"]
+            slides_data = repair_truncated_json(content_text)
+            
+            if slides_data and "slides" in slides_data:
+                slides = slides_data["slides"]
+                if not slides:
+                    return None
+                
+                for i, slide in enumerate(slides):
+                    if 'bullets' not in slide:
+                        slide['bullets'] = []
+                    if 'image_prompt' not in slide:
+                        slide['image_prompt'] = slide.get('title', topic)
+                    if 'speaker_notes' not in slide:
+                        slide['speaker_notes'] = ""
+                
+                return slides
+        return None
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+        return None
+
+# ============================================================================
+# POWERPOINT CREATION
+# ============================================================================
+
+def create_powerpoint(slides_content, theme, image_mode, google_api_key, google_cx, use_unsplash, topic):
+    """Create PowerPoint presentation"""
+    prs = Presentation()
+    prs.slide_width = Inches(10)
+    prs.slide_height = Inches(7.5)
+    
+    themes = {
+        "Corporate Blue": {"bg": RGBColor(240, 248, 255), "accent": RGBColor(31, 119, 180), "text": RGBColor(0, 0, 0)},
+        "Modern Purple": {"bg": RGBColor(240, 242, 246), "accent": RGBColor(138, 43, 226), "text": RGBColor(0, 0, 0)},
+        "Dark": {"bg": RGBColor(30, 30, 30), "accent": RGBColor(255, 215, 0), "text": RGBColor(255, 255, 255)},
+        "Soft Pastel": {"bg": RGBColor(255, 250, 240), "accent": RGBColor(255, 182, 193), "text": RGBColor(60, 60, 60)},
+        "Green": {"bg": RGBColor(245, 255, 250), "accent": RGBColor(34, 139, 34), "text": RGBColor(0, 0, 0)}
+    }
+    
+    color_scheme = themes.get(theme, themes["Corporate Blue"])
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, slide_data in enumerate(slides_content):
+        status_text.text(f"Creating slide {idx + 1}/{len(slides_content)}...")
+        progress_bar.progress((idx + 1) / len(slides_content))
+        
+        blank_slide_layout = prs.slide_layouts[6]
+        slide = prs.slides.add_slide(blank_slide_layout)
+        
+        # Background
+        background = slide.background
+        fill = background.fill
+        fill.solid()
+        fill.fore_color.rgb = color_scheme["bg"]
+        
+        # Title
+        title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(8.5), Inches(1))
+        title_frame = title_box.text_frame
+        title_frame.text = slide_data["title"]
+        title_frame.paragraphs[0].font.size = Pt(36 if idx == 0 else 28)
+        title_frame.paragraphs[0].font.bold = True
+        title_frame.paragraphs[0].font.color.rgb = color_scheme["accent"]
+        title_frame.paragraphs[0].alignment = PP_ALIGN.CENTER if idx == 0 else PP_ALIGN.LEFT
+        
+        # Bullets
+        if idx > 0 and slide_data.get("bullets"):
+            bullet_width = Inches(5.5) if image_mode == "With Images" else Inches(9)
+            bullet_box = slide.shapes.add_textbox(Inches(0.5), Inches(2), bullet_width, Inches(4.5))
+            text_frame = bullet_box.text_frame
+            text_frame.word_wrap = True
+            
+            for bullet in slide_data["bullets"]:
+                p = text_frame.add_paragraph()
+                p.text = bullet
+                p.level = 0
+                p.font.size = Pt(18)
+                p.font.color.rgb = color_scheme["text"]
+                p.space_after = Pt(12)
+        
+        # Speaker Notes
+        if slide_data.get("speaker_notes"):
+            notes_slide = slide.notes_slide
+            notes_slide.notes_text_frame.text = slide_data["speaker_notes"]
+        
+        # Images
+        if idx > 0 and image_mode == "With Images":
+            image_data = get_topic_relevant_image(
+                topic,
+                slide_data["title"],
+                google_api_key,
+                google_cx,
+                use_unsplash
+            )
+            if image_data:
+                try:
+                    image_stream = io.BytesIO(image_data)
+                    slide.shapes.add_picture(
+                        image_stream,
+                        Inches(6.5),
+                        Inches(2),
+                        width=Inches(3)
+                    )
+                except:
+                    pass
+        
+        time.sleep(0.2)
+    
+    progress_bar.progress(1.0)
+    status_text.text("✅ Presentation created!")
+    return prs
+
+# ============================================================================
+# LOGIN PAGE
+# ============================================================================
+
 def show_login_page():
-    """Login page - same for admin and users"""
+    """Login page"""
     st.markdown("""
         <style>
         .login-container {
@@ -346,7 +669,10 @@ def show_login_page():
         
         st.markdown('</div>', unsafe_allow_html=True)
 
-# ============ PAGE CONFIG ============
+# ============================================================================
+# PAGE CONFIGURATION
+# ============================================================================
+
 st.set_page_config(
     page_title="AI PPT Generator Pro",
     page_icon="📊",
@@ -359,12 +685,17 @@ if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if 'user' not in st.session_state:
     st.session_state.user = None
+if 'google_searches_used' not in st.session_state:
+    st.session_state.google_searches_used = 0
 
 if not st.session_state.logged_in:
     show_login_page()
     st.stop()
 
-# ============ STYLES ============
+# ============================================================================
+# STYLES
+# ============================================================================
+
 st.markdown("""
 <style>
 .main-header {
@@ -419,7 +750,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ============ SIDEBAR (Common for both) ============
+# ============================================================================
+# SIDEBAR (Common)
+# ============================================================================
+
 with st.sidebar:
     user_stats = get_user_stats(st.session_state.user['id'])
     st.markdown(f"""
@@ -439,11 +773,16 @@ with st.sidebar:
         st.session_state.logged_in = False
         st.session_state.user = None
         st.rerun()
+    
+    st.markdown("---")
 
-# ============ ADMIN DASHBOARD (Completely Separate) ============
+# ============================================================================
+# ADMIN DASHBOARD
+# ============================================================================
+
 if st.session_state.user['role'] == 'admin':
     
-    st.markdown('<div class="admin-header"><h1>👑 Admin Dashboard</h1><p>Complete System Overview & User Management</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="admin-header"><h1>👑 Admin Dashboard</h1><p>Complete System Overview & Management</p></div>', unsafe_allow_html=True)
     
     # Top Stats
     sys_stats = get_system_stats()
@@ -474,33 +813,29 @@ if st.session_state.user['role'] == 'admin':
     
     # Admin Tabs
     admin_tab1, admin_tab2, admin_tab3, admin_tab4 = st.tabs([
-        "🟢 Live Activity Dashboard",
+        "🟢 Live Dashboard",
         "➕ Create User",
         "👥 Manage Users",
-        "📊 All Activities Log"
+        "📊 Activity Log"
     ])
     
-    # ========== TAB 1: LIVE ACTIVITY DASHBOARD ==========
+    # TAB 1: LIVE DASHBOARD
     with admin_tab1:
         st.markdown("## 🟢 Live User Activity Dashboard")
-        st.info("🔄 This shows real-time data - refresh to see latest updates")
         
-        if st.button("🔄 Refresh Dashboard", key="refresh_dash", type="primary"):
+        if st.button("🔄 Refresh", key="refresh_dash", type="primary"):
             st.rerun()
         
         st.markdown("---")
-        
-        # Currently Logged In Users
         st.markdown("### 👥 Currently Logged In Users")
+        
         active_users = get_currently_logged_in_users()
         
         if active_users:
-            st.success(f"**{len(active_users)} user(s) currently online**")
+            st.success(f"**{len(active_users)} user(s) online**")
             
             for user in active_users:
                 user_id, username, email, login_time, role = user
-                
-                # Get user's stats
                 user_activity_stats = get_user_stats(user_id)
                 
                 col_a, col_b = st.columns([3, 1])
@@ -516,73 +851,49 @@ if st.session_state.user['role'] == 'admin':
                     """, unsafe_allow_html=True)
                 
                 with col_b:
-                    st.markdown("**User Stats:**")
-                    st.write(f"📊 {user_activity_stats['total_presentations']} presentations")
+                    st.markdown("**Stats:**")
+                    st.write(f"📊 {user_activity_stats['total_presentations']} ppts")
                     st.write(f"📄 {user_activity_stats['total_slides']} slides")
                 
-                # Show recent activities of this user
-                with st.expander(f"📜 View {username}'s Recent Activities"):
+                with st.expander(f"📜 {username}'s Activities"):
                     activities = get_user_activity_details(user_id)
-                    
                     if activities:
                         for activity in activities:
                             action, topic, slides_count, timestamp = activity
-                            
                             if action == 'generate_presentation':
                                 st.markdown(f"""
 <div class='activity-card'>
     <b>📊 Generated Presentation</b><br>
-    <small>📌 Topic: {topic}</small><br>
-    <small>📄 Slides: {slides_count}</small><br>
-    <small>🕒 {timestamp}</small>
-</div>
-                                """, unsafe_allow_html=True)
-                            elif action == 'login':
-                                st.markdown(f"""
-<div class='activity-card'>
-    <b>🔓 Logged In</b><br>
+    <small>📌 {topic}</small><br>
+    <small>📄 {slides_count} slides</small><br>
     <small>🕒 {timestamp}</small>
 </div>
                                 """, unsafe_allow_html=True)
                     else:
-                        st.info("No recent activities")
+                        st.info("No activities yet")
                 
                 st.markdown("---")
         else:
-            st.warning("⚠️ No users currently logged in")
+            st.warning("⚠️ No users online")
         
-        st.markdown("---")
-        
-        # Recent Activity Summary
-        st.markdown("### 📊 Recent System Activities (Last 10)")
+        st.markdown("### 📊 Recent System Activities")
         all_activities = get_all_user_activities()
         
         if all_activities:
             for activity in all_activities[:10]:
                 username, action, topic, slides_count, timestamp = activity
-                
                 if action == 'generate_presentation':
                     st.markdown(f"""
 <div class='activity-card'>
-    👤 <b>{username}</b> generated a presentation<br>
-    <small>📌 Topic: {topic} | 📄 Slides: {slides_count}</small><br>
+    👤 <b>{username}</b> generated presentation<br>
+    <small>📌 {topic} | 📄 {slides_count} slides</small><br>
     <small>🕒 {timestamp}</small>
 </div>
                     """, unsafe_allow_html=True)
-                elif action == 'login':
-                    st.markdown(f"""
-<div class='activity-card'>
-    👤 <b>{username}</b> logged in<br>
-    <small>🕒 {timestamp}</small>
-</div>
-                    """, unsafe_allow_html=True)
-        else:
-            st.info("No recent activities")
     
-    # ========== TAB 2: CREATE USER ==========
+    # TAB 2: CREATE USER
     with admin_tab2:
-        st.markdown("### ➕ Create New User Account")
-        st.info("💡 Create user accounts and provide credentials to users")
+        st.markdown("### ➕ Create New User")
         
         with st.form("create_user_form"):
             col_a, col_b = st.columns(2)
@@ -591,7 +902,7 @@ if st.session_state.user['role'] == 'admin':
                 new_email = st.text_input("Email", placeholder="john@company.com")
             with col_b:
                 new_password = st.text_input("Password *", type="password", placeholder="Min 6 chars")
-                confirm_password = st.text_input("Confirm Password *", type="password")
+                confirm_password = st.text_input("Confirm *", type="password")
             
             submitted = st.form_submit_button("✅ Create User", use_container_width=True, type="primary")
             
@@ -602,30 +913,27 @@ if st.session_state.user['role'] == 'admin':
                             success = create_user_by_admin(new_username, new_password, new_email)
                             if success:
                                 st.success(f"""
-### ✅ User Created Successfully!
+### ✅ User Created!
 
-**Share these credentials with the user:**
+**Share credentials:**
 
-📧 **Username:** `{new_username}`  
-🔑 **Password:** `{new_password}`  
-
-✉️ Send them these login details.
+📧 Username: `{new_username}`  
+🔑 Password: `{new_password}`
                                 """)
                             else:
-                                st.error("❌ Username already exists!")
+                                st.error("❌ Username exists!")
                         else:
-                            st.error("❌ Password must be at least 6 characters")
+                            st.error("❌ Password min 6 chars")
                     else:
                         st.error("❌ Passwords don't match")
                 else:
-                    st.warning("⚠️ Fill all required fields")
+                    st.warning("⚠️ Fill all fields")
     
-    # ========== TAB 3: MANAGE USERS ==========
+    # TAB 3: MANAGE USERS
     with admin_tab3:
-        st.markdown("### 👥 All Users Management")
+        st.markdown("### 👥 All Users")
         
         users = get_all_users()
-        
         user_data = []
         for user in users:
             user_data.append({
@@ -645,38 +953,35 @@ if st.session_state.user['role'] == 'admin':
         st.markdown("### ⚙️ User Actions")
         
         col_m1, col_m2, col_m3 = st.columns(3)
-        
         with col_m1:
-            user_id_action = st.number_input("User ID", min_value=1, step=1, key="user_manage_id")
-        
+            user_id_action = st.number_input("User ID", min_value=1, step=1)
         with col_m2:
-            action_type = st.selectbox("Action", ["Enable Account", "Disable Account", "Delete User"])
-        
+            action_type = st.selectbox("Action", ["Enable", "Disable", "Delete"])
         with col_m3:
             st.write("")
             if st.button("▶️ Execute", use_container_width=True, type="primary"):
                 if user_id_action == 1:
-                    st.error("❌ Cannot modify admin account!")
+                    st.error("❌ Can't modify admin!")
                 else:
-                    if action_type == "Enable Account":
+                    if action_type == "Enable":
                         toggle_user_status(user_id_action, 1)
                         st.success(f"✅ User {user_id_action} enabled!")
                         time.sleep(1)
                         st.rerun()
-                    elif action_type == "Disable Account":
+                    elif action_type == "Disable":
                         toggle_user_status(user_id_action, 0)
                         st.warning(f"⚠️ User {user_id_action} disabled!")
                         time.sleep(1)
                         st.rerun()
-                    elif action_type == "Delete User":
+                    elif action_type == "Delete":
                         delete_user(user_id_action)
                         st.error(f"🗑️ User {user_id_action} deleted!")
                         time.sleep(1)
                         st.rerun()
     
-    # ========== TAB 4: ALL ACTIVITIES LOG ==========
+    # TAB 4: ACTIVITY LOG
     with admin_tab4:
-        st.markdown("### 📊 Complete Activity Log (Last 100)")
+        st.markdown("### 📊 Complete Activity Log")
         
         all_activities = get_all_user_activities()
         
@@ -684,7 +989,6 @@ if st.session_state.user['role'] == 'admin':
             activity_records = []
             for activity in all_activities:
                 username, action, topic, slides_count, timestamp = activity
-                
                 activity_records.append({
                     'Username': username,
                     'Action': action,
@@ -696,58 +1000,152 @@ if st.session_state.user['role'] == 'admin':
             df_activities = pd.DataFrame(activity_records)
             st.dataframe(df_activities, use_container_width=True, height=600)
             
-            # Download option
             csv = df_activities.to_csv(index=False)
             st.download_button(
-                "📥 Download Activity Log (CSV)",
+                "📥 Download CSV",
                 csv,
-                f"activity_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv",
-                key='download-csv'
+                f"activity_{datetime.now().strftime('%Y%m%d')}.csv",
+                "text/csv"
             )
-        else:
-            st.info("No activities logged yet")
 
-# ============ REGULAR USER PANEL (Completely Different View) ============
+# ============================================================================
+# USER PANEL (Complete PPT Generator)
+# ============================================================================
+
 else:
     
-    st.markdown('<div class="main-header"><h1>📊 AI PowerPoint Generator</h1><p>Create Professional Presentations with AI</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header"><h1>📊 AI PowerPoint Generator</h1><p>Create Professional Presentations</p></div>', unsafe_allow_html=True)
     
-    st.markdown("## 📝 Create Your Presentation")
+    # API Keys in Sidebar
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("### 🔑 API Keys")
+        
+        with st.expander("AI Models", expanded=True):
+            model_choice = st.selectbox(
+                "Select Model",
+                [
+                    "Free (Google Gemini)",
+                    "Free (Meta Llama 3.2)",
+                    "Free (Mistral 7B)",
+                    "Groq (Llama 3.3) - FREE",
+                    "Groq (Mixtral) - FREE",
+                    "Claude Sonnet (Paid)"
+                ]
+            )
+            
+            groq_api_key = None
+            if "Groq" in model_choice:
+                groq_api_key = st.text_input("Groq API Key", type="password", help="Get free from https://console.groq.com/")
+                if groq_api_key:
+                    st.success("✅ Groq configured")
+            else:
+                openrouter_key = st.text_input("OpenRouter API Key", type="password", help="For AI models")
+        
+        with st.expander("Image Settings"):
+            google_api_key = st.text_input("Google API Key", type="password")
+            google_cx = st.text_input("Google CX ID")
+            use_unsplash = st.checkbox("Use Unsplash", value=True)
+    
+    # Main Content
+    st.markdown("## 📝 Create Presentation")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        topic = st.text_input("📌 Presentation Topic", placeholder="e.g., AI in Healthcare")
+        topic = st.text_input("📌 Topic", placeholder="e.g., AI in Healthcare")
         category = st.selectbox("📂 Category", ["Business", "Technical", "Marketing", "Sales", "Education"])
+        slide_count = st.number_input("📄 Slides", min_value=5, max_value=30, value=10)
     
     with col2:
-        slide_count = st.number_input("📄 Number of Slides", min_value=5, max_value=30, value=10)
         tone = st.selectbox("🎨 Tone", ["Professional", "Casual", "Formal", "Creative"])
+        theme = st.selectbox("🎨 Theme", ["Corporate Blue", "Modern Purple", "Dark", "Soft Pastel", "Green"])
+        image_mode = st.selectbox("🖼️ Images", ["With Images", "No Images"])
+    
+    language = st.selectbox("🌍 Language", ["English", "Hindi", "Spanish", "French", "German"])
+    
+    key_points = st.text_area("💡 Key Points (Optional)", placeholder="- Point 1\n- Point 2")
     
     st.markdown("---")
     
     if st.button("🚀 Generate Presentation", type="primary", use_container_width=True):
         if topic:
-            # Log the activity
-            log_usage(st.session_state.user['id'], 'generate_presentation', topic, slide_count)
+            # Check API keys
+            has_api = False
+            if "Groq" in model_choice and groq_api_key:
+                has_api = True
+            elif "Groq" not in model_choice and 'openrouter_key' in locals() and openrouter_key:
+                has_api = True
             
-            st.success(f"✅ Generating {slide_count} slides on: **{topic}**")
-            st.info("🔧 Your full PPT generation code goes here...")
-            
-            # Simulate some processing
-            with st.spinner("Creating presentation..."):
-                time.sleep(2)
-            
-            st.success("✅ Presentation generated successfully!")
-            st.balloons()
-            
+            if not has_api:
+                st.error("⚠️ Please enter API key in sidebar")
+            else:
+                with st.spinner("🤖 Generating content..."):
+                    slides_content = generate_content_with_ai(
+                        openrouter_key if 'openrouter_key' in locals() else "",
+                        topic,
+                        category,
+                        slide_count,
+                        tone,
+                        "",
+                        key_points,
+                        model_choice,
+                        language,
+                        groq_api_key
+                    )
+                
+                if slides_content:
+                    log_usage(st.session_state.user['id'], 'generate_presentation', topic, len(slides_content))
+                    
+                    st.success(f"✅ Generated {len(slides_content)} slides!")
+                    
+                    with st.spinner("📊 Creating PowerPoint..."):
+                        prs = create_powerpoint(
+                            slides_content,
+                            theme,
+                            image_mode,
+                            google_api_key if 'google_api_key' in locals() else "",
+                            google_cx if 'google_cx' in locals() else "",
+                            use_unsplash,
+                            topic
+                        )
+                    
+                    pptx_io = io.BytesIO()
+                    prs.save(pptx_io)
+                    pptx_io.seek(0)
+                    
+                    st.markdown("---")
+                    st.markdown("### 🎉 Presentation Ready!")
+                    
+                    col_dl1, col_dl2, col_dl3 = st.columns([1, 2, 1])
+                    with col_dl2:
+                        st.download_button(
+                            label="📥 DOWNLOAD POWERPOINT",
+                            data=pptx_io.getvalue(),
+                            file_name=f"{topic.replace(' ', '_')}.pptx",
+                            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                            use_container_width=True,
+                            type="primary"
+                        )
+                    
+                    st.balloons()
+                    
+                    # Preview
+                    with st.expander("📄 Preview Slides"):
+                        for idx, slide in enumerate(slides_content):
+                            st.markdown(f"### Slide {idx + 1}: {slide['title']}")
+                            if slide.get('bullets'):
+                                for bullet in slide['bullets']:
+                                    st.markdown(f"• {bullet}")
+                            st.markdown("---")
+                else:
+                    st.error("❌ Failed to generate content. Try another model.")
         else:
             st.error("⚠️ Please enter a topic")
     
     st.markdown("---")
     
-    # User's Recent Activity
+    # User's Activity
     st.markdown("### 📊 Your Recent Activities")
     
     my_activities = get_user_activity_details(st.session_state.user['id'])
@@ -755,13 +1153,12 @@ else:
     if my_activities:
         for activity in my_activities[:10]:
             action, topic, slides_count, timestamp = activity
-            
             if action == 'generate_presentation':
                 st.markdown(f"""
 <div class='activity-card'>
     <b>📊 Generated Presentation</b><br>
-    <small>📌 Topic: {topic}</small><br>
-    <small>📄 Slides: {slides_count}</small><br>
+    <small>📌 {topic}</small><br>
+    <small>📄 {slides_count} slides</small><br>
     <small>🕒 {timestamp}</small>
 </div>
                 """, unsafe_allow_html=True)
